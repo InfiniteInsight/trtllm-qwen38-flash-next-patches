@@ -1,0 +1,339 @@
+--- a/tensorrt_llm/_torch/models/checkpoints/hf/qwen4_exp_weight_mapper.py
++++ b/tensorrt_llm/_torch/models/checkpoints/hf/qwen4_exp_weight_mapper.py
+@@ -648,3 +648,336 @@
+                 table.data[local_rows:].zero_()
+             if table.data_ptr() != table_ptr:
+                 raise RuntimeError("PLE n-gram table address changed while loading")
++
++
++# ============================================================================
++# Asymmetric TP=2 / EP=2 MoE Expert Placement Patch for Heterogeneous VRAM
++# (Rank 0: RTX PRO 5000 72GB, Rank 1: RTX PRO 5000 48GB)
++# ============================================================================
++import os
++import triton
++import triton.language as tl
++from typing import Optional
++from tensorrt_llm.logger import logger
++import tensorrt_llm._torch.moe.fused_moe.interface as _moe_interface
++import tensorrt_llm._torch.moe.fused_moe.impl_base as _moe_impl_base
++import tensorrt_llm._torch.moe.fused_moe.fused_moe_triton_fp8_block_scale as _triton_fp8_moe
++from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import (
++    CutlassFusedMoE,
++    W4A16NVFP4CutlassFusedMoEMethod,
++    get_sm_version,
++    require_comm_plan,
++)
++from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoERunContext
++
++
++@triton.jit
++def _patched_moe_prefix_kernel(
++    counts_ptr,
++    out_off_ptr,
++    num_post_pad_ptr,
++    BLOCK_SIZE: tl.constexpr,
++    NUM_EXPERTS: tl.constexpr,
++    NUM_EXPERTS_P2: tl.constexpr,
++):
++    """Compute exclusive offsets from padded expert counts for arbitrary expert counts."""
++    e = tl.arange(0, NUM_EXPERTS_P2)
++    m = e < NUM_EXPERTS
++    counts = tl.load(counts_ptr + e, mask=m, other=0).to(tl.int32)
++    padded = ((counts + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
++    inc = tl.associative_scan(padded, 0, _triton_fp8_moe._int32_add)
++    out_off = inc - padded
++    tl.store(out_off_ptr + e, out_off, mask=m)
++    tl.store(num_post_pad_ptr, tl.sum(padded).to(tl.int32))
++
++
++def _patched_moe_align_block_size(
++    topk_ids: torch.Tensor,
++    block_size: int,
++    num_experts: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    device = topk_ids.device
++    flat_ids = topk_ids.reshape(-1).to(torch.int32)
++    N = flat_ids.shape[0]
++
++    max_tokens_static = N + num_experts * block_size
++    num_m_blocks_static = N // block_size + num_experts
++
++    counts = torch.zeros(num_experts, dtype=torch.int32, device=device)
++    out_offsets = torch.empty(num_experts, dtype=torch.int32, device=device)
++    sorted_token_ids = torch.full((max_tokens_static,), N, dtype=torch.int32, device=device)
++    expert_ids_out = torch.empty((num_m_blocks_static,), dtype=torch.int32, device=device)
++    num_post_pad = torch.empty(1, dtype=torch.int32, device=device)
++
++    _BLOCK_N = 32
++
++    if N > 0:
++        _triton_fp8_moe._moe_histogram_kernel[triton.cdiv(N, _BLOCK_N),](
++            flat_ids, counts, N, BLOCK_N=_BLOCK_N
++        )
++
++    _patched_moe_prefix_kernel[1,](
++        counts,
++        out_offsets,
++        num_post_pad,
++        BLOCK_SIZE=block_size,
++        NUM_EXPERTS=num_experts,
++        NUM_EXPERTS_P2=triton.next_power_of_2(num_experts),
++    )
++
++    _triton_fp8_moe._moe_expert_ids_kernel[num_experts,](
++        counts,
++        out_offsets,
++        expert_ids_out,
++        num_experts=num_experts,
++        BLOCK_SIZE=block_size,
++    )
++
++    if N > 0:
++        counters = out_offsets.clone()
++        _triton_fp8_moe._moe_scatter_kernel[triton.cdiv(N, _BLOCK_N),](
++            flat_ids, counters, sorted_token_ids, N, BLOCK_N=_BLOCK_N
++        )
++
++    return sorted_token_ids, expert_ids_out, num_post_pad
++
++
++def _install_asymmetric_moe_patch() -> None:
++    if getattr(_moe_interface, "_asymmetric_moe_patched", False):
++        return
++
++    # Default: shift 8 NVFP4 MoE layers (layers 0..7) to a (504, 8) expert split
++    # between Rank 0 (72GB) and Rank 1 (48GB), moving 1,984 experts (~5.11 GiB)
++    # off Rank 1 onto Rank 0 while keeping the remaining 40 target layers + 1 MTP
++    # layer at the stock symmetric (256, 256) split with zero runtime overhead.
++    asym_layers_str = os.environ.get(
++        "TRTLLM_ASYM_LAYERS", "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34"
++    ).strip()
++    if asym_layers_str.lower() in ("none", "off", ""):
++        asym_layers: set[int] = set()
++    else:
++        asym_layers = {int(x) for x in asym_layers_str.split(",") if x.strip()}
++
++    asym_split_str = os.environ.get("TRTLLM_ASYM_SPLIT", "384,128").strip()
++    asym_sizes = [int(x) for x in asym_split_str.split(",") if x.strip()]
++
++    _orig_compute_ep_partition = _moe_interface._compute_ep_partition
++
++    def _patched_compute_ep_partition(
++        num_experts: int,
++        ep_size: int,
++        ep_rank: int,
++        layer_idx: Optional[int] = None,
++    ) -> tuple:
++        if (
++            layer_idx is not None
++            and layer_idx in asym_layers
++            and len(asym_sizes) == ep_size
++            and sum(asym_sizes) == num_experts
++            and min(asym_sizes) > 0
++        ):
++            slot_start = sum(asym_sizes[:ep_rank])
++            return asym_sizes[ep_rank], slot_start, slot_start + asym_sizes[ep_rank]
++
++        split_env = os.environ.get("TRTLLM_EP_SPLIT", "").strip()
++        if split_env:
++            sizes = [int(v) for v in split_env.split(",") if v.strip()]
++            if len(sizes) == ep_size and sum(sizes) == num_experts and min(sizes) > 0:
++                slot_start = sum(sizes[:ep_rank])
++                return sizes[ep_rank], slot_start, slot_start + sizes[ep_rank]
++
++        return _orig_compute_ep_partition(num_experts, ep_size, ep_rank)
++
++    _orig_init_load_balancer = _moe_interface.MoE._init_load_balancer
++
++    def _patched_init_load_balancer(self, model_config, aux_stream_dict=None):
++        _orig_init_load_balancer(self, model_config, aux_stream_dict)
++        if self.layer_load_balancer is None and self.ep_size > 1:
++            _size, _start, _end = _patched_compute_ep_partition(
++                self.num_experts,
++                self.ep_size,
++                self.ep_rank,
++                layer_idx=self.layer_idx,
++            )
++            self.expert_size_per_partition = _size
++            self.num_slots = self.num_experts
++            self.slot_start = _start
++            self.slot_end = _end
++            self.initial_local_expert_ids = self.initial_global_assignments[
++                self.slot_start : self.slot_end
++            ]
++            if self.layer_idx in asym_layers:
++                logger.info(
++                    f"[AsymmetricMoE] Layer {self.layer_idx} EP rank {self.ep_rank}/{self.ep_size}: "
++                    f"allocated {_size} local experts [{_start}:{_end})"
++                )
++
++    def _patched_cutlass_run_moe(
++        self,
++        ctx: MoERunContext,
++        *,
++        workspace: Optional[dict] = None,
++    ) -> torch.Tensor:
++        del workspace
++        plan = require_comm_plan(self, ctx)
++        x = ctx.x
++        token_selected_experts = ctx.token_selected_experts
++        token_final_scales = ctx.token_final_scales
++        x_sf = ctx.x_sf
++        output_dtype = ctx.output_dtype
++        lora_params = ctx.lora_params
++        is_sf_swizzled = plan.input_sf_swizzled
++        moe_output = plan.moe_output
++        enable_alltoall = plan.enable_alltoall
++        tuner_num_tokens, tuner_top_k = self._tuner_shapes(ctx, enable_alltoall)
++
++        if isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod):
++            return self._run_moe_w4a16_nvfp4(
++                x,
++                token_selected_experts,
++                token_final_scales,
++                output_dtype=output_dtype,
++                tuner_num_tokens=tuner_num_tokens,
++                tuner_top_k=tuner_top_k,
++                moe_output=moe_output,
++                enable_alltoall=enable_alltoall,
++            )
++
++        if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
++            from tensorrt_llm._torch.moe.fused_moe.fused_moe_triton_fp8_block_scale import (
++                run_triton_fp8_block_scale_moe,
++            )
++
++            if token_final_scales is None:
++                token_final_scales = torch.ones_like(
++                    token_selected_experts, dtype=torch.float32
++                )
++            local_n = self.expert_size_per_partition
++            if enable_alltoall:
++                local_ids = token_selected_experts.clamp(0, local_n - 1)
++                is_local = token_selected_experts < local_n
++            else:
++                slot_start = self.slot_start
++                local_ids = (token_selected_experts - slot_start).clamp(0, local_n - 1)
++                is_local = (token_selected_experts >= slot_start) & (
++                    token_selected_experts < slot_start + local_n
++                )
++            local_scales = token_final_scales * is_local.to(token_final_scales.dtype)
++            return run_triton_fp8_block_scale_moe(
++                x,
++                local_ids,
++                local_scales,
++                self.w3_w1_weight,
++                self.quant_scales.fc_weight_scales,
++                self.w2_weight,
++                self.quant_scales.proj_weight_scales,
++                activation_type=self.activation_type,
++                output_dtype=output_dtype,
++            )
++
++        if self.has_w4a16_mxfp4:
++            pad_size = self.hidden_size - x.shape[-1]
++            if pad_size > 0:
++                x = torch.nn.functional.pad(x, (0, pad_size))
++
++        weight_dtype = self.w3_w1_weight.dtype
++        if self.has_any_quant:
++            if self.has_w4afp8:
++                weight_dtype = torch.quint4x2
++            elif self.has_w4a16_mxfp4:
++                weight_dtype = torch.uint8
++
++        use_dynamic_fc2_scale = (
++            self.has_nvfp4
++            and getattr(self, "force_dynamic_quantization", False)
++            and hasattr(self, "fc2_weight_scale_2")
++        )
++
++        lora_kwargs = self._extract_moe_lora_tensors(lora_params)
++        if lora_kwargs is None:
++            lora_kwargs = {}
++
++        op_ep_size, op_ep_rank = self.ep_size, self.ep_rank
++        if (
++            not enable_alltoall
++            and self.ep_size > 1
++            and (
++                os.environ.get("TRTLLM_EP_FORCE_LOCAL_IDS") == "1"
++                or self.expert_size_per_partition * self.ep_size != self.num_experts
++                or self.slot_start != self.ep_rank * self.expert_size_per_partition
++            )
++        ):
++            local_n = self.expert_size_per_partition
++            if self.slot_start == 0:
++                token_selected_experts = token_selected_experts.clamp(max=local_n)
++            else:
++                rel = token_selected_experts - self.slot_start
++                is_local = (rel >= 0) & (rel < local_n)
++                token_selected_experts = torch.where(is_local, rel, local_n)
++            op_ep_size, op_ep_rank = 1, 0
++
++        result = torch.ops.trtllm.fused_moe(
++            x,
++            token_selected_experts,
++            token_final_scales,
++            self.w3_w1_weight.view(weight_dtype),
++            self.w3_w1_bias,
++            self.w2_weight.view(weight_dtype),
++            self.w2_bias,
++            output_dtype,
++            quant_scales=list(self.quant_scales)
++            + ([self.fc2_weight_scale_2] if use_dynamic_fc2_scale else []),
++            input_sf=x_sf,
++            swizzled_input_sf=is_sf_swizzled,
++            swiglu_alpha=self.act_alpha,
++            swiglu_beta=self.act_beta,
++            swiglu_limit=self.act_clamp,
++            tp_size=self.tp_size,
++            tp_rank=self.tp_rank,
++            ep_size=op_ep_size,
++            ep_rank=op_ep_rank,
++            cluster_size=self.cluster_size,
++            cluster_rank=self.cluster_rank,
++            enable_alltoall=enable_alltoall,
++            use_deepseek_fp8_block_scale=self.has_deepseek_fp8_block_scales,
++            use_w4_group_scaling=self.has_w4afp8 or self.has_w4a16_mxfp4,
++            use_int8_woq_per_channel=self.has_int8_woq_per_channel,
++            use_mxfp8_act_scaling=self.has_w4a8_mxfp4_mxfp8 or self.has_mxfp8,
++            min_latency_mode=False,
++            use_fused_finalize=self.use_fused_finalize,
++            tune_max_num_tokens=self.tune_max_num_tokens,
++            tuner_num_tokens=tuner_num_tokens,
++            tuner_top_k=tuner_top_k,
++            activation_type=self.activation_type,
++            unpadded_hidden_size=self.unpadded_hidden_size,
++            out_tensor=moe_output,
++            use_dynamic_fc2_scale=use_dynamic_fc2_scale,
++            use_mxfp8_weight_scaling=self.has_mxfp8,
++            **lora_kwargs,
++        )
++        if moe_output is not None:
++            final_hidden_states = moe_output
++        else:
++            final_hidden_states = result[0]
++
++        return final_hidden_states
++
++    _moe_interface._compute_ep_partition = _patched_compute_ep_partition
++    _moe_impl_base._compute_ep_partition = _patched_compute_ep_partition
++    _moe_interface.MoE._init_load_balancer = _patched_init_load_balancer
++    CutlassFusedMoE.run_moe = _patched_cutlass_run_moe
++    _triton_fp8_moe._moe_prefix_kernel = _patched_moe_prefix_kernel
++    _triton_fp8_moe.moe_align_block_size = _patched_moe_align_block_size
++    from tensorrt_llm._torch.autotuner import AutoTuner
++    AutoTuner._maybe_parallelize_tactics = (
++        lambda self, all_valid_tactics, strategy: all_valid_tactics
++    )
++    _moe_interface._asymmetric_moe_patched = True
++    logger.info(
++        f"[AsymmetricMoE] Installed asymmetric MoE weight mapper patch: "
++        f"asym_layers={sorted(asym_layers)}, asym_split={asym_sizes}, "
++        f"ep_split_env={os.environ.get('TRTLLM_EP_SPLIT', '')!r}"
++    )
++
++
++_install_asymmetric_moe_patch()

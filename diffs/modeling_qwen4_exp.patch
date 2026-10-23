@@ -1,0 +1,40 @@
+--- a/tensorrt_llm/_torch/models/modeling_qwen4_exp.py
++++ b/tensorrt_llm/_torch/models/modeling_qwen4_exp.py
+@@ -344,6 +344,18 @@
+ 
+             # Attention block: mix -> mixer -> attn_tp_all_reduce -> combine.
+             mixed, residual = self.attn_hyper_connection.mix(hidden_states)
++        # Speculative-decoding tap (DFlash / DSpark / EAGLE3 / SAVE_HIDDEN_STATES).
++        # Tap id i means "the hidden state after layer i". Qwen4-Exp carries
++        # hc_count residual streams, so that state only exists in contracted,
++        # hidden_size-wide form as the mix that layer i+1's attention consumes,
++        # which is also the reference HF capture convention for this model.
++        if (
++            spec_metadata is not None
++            and self.layer_idx > 0
++            and not isinstance(self, Qwen4ExpMTP)
++            and spec_metadata.is_layer_capture(self.layer_idx - 1)
++        ):
++            spec_metadata.maybe_capture_hidden_states(self.layer_idx - 1, mixed, None)
+         no_reduce = AllReduceParams(enable_allreduce=False)
+         if self.layer_type == "linear_attention":
+             attn_out = self.linear_attn(
+@@ -859,6 +871,18 @@
+         if pending_combine is not None:
+             raise RuntimeError("the last decoder layer must materialize the residual bundle")
+ 
++        # Final-state tap: after the last layer the only hidden_size-wide state is
++        # the final Hyper-Connection mixer's output (it is also the last norm).
++        # Serves tap id num_hidden_layers-1 and the -1 "last post-norm" slot that
++        # SAVE_HIDDEN_STATES records alongside the aux taps.
++        if spec_metadata is not None and self.model_config.mapping.is_last_pp_rank():
++            final_state = None
++            for tap_id in (self.num_hidden_layers - 1, -1):
++                if spec_metadata.is_layer_capture(tap_id):
++                    if final_state is None:
++                        final_state = self.hyper_connection_mixer.mix(hidden_states)[0]
++                    spec_metadata.maybe_capture_hidden_states(tap_id, final_state, None)
++
+         # Preserve the widened bundle for both the next PP stage and the
+         # optional recurrent MTP layer. Qwen4ExpLogitsProcessor owns the final
+         # Hyper-Connection collapse on the last PP stage.

@@ -1,0 +1,19 @@
+--- a/tensorrt_llm/_torch/models/qwen4_ple.py
++++ b/tensorrt_llm/_torch/models/qwen4_ple.py
+@@ -431,7 +431,15 @@
+         return mapped_ptr
+ 
+     def _apply(self, fn, recurse: bool = True) -> "Qwen4ExpPinnedHostEmbedding":
+-        """Apply module transforms without moving or replacing the host table."""
++        """Apply module transforms without moving or replacing the host table.
++
++        Pipeline parallelism strips layers this rank does not own via
++        remove_weights(), which clears _parameters; the pop below would then
++        raise KeyError, so honor the same _weights_removed flag the loader and
++        the qwen4_exp weight mapper already check.
++        """
++        if getattr(self, "_weights_removed", False):
++            return self
+         weight = self._parameters.pop("weight")
+         try:
+             result = super()._apply(fn, recurse=recurse)

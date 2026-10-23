@@ -1,0 +1,82 @@
+--- a/tensorrt_llm/_torch/attention/backends/sparse/qsa/metadata.py
++++ b/tensorrt_llm/_torch/attention/backends/sparse/qsa/metadata.py
+@@ -53,6 +53,9 @@
+         self.qsa_shared_topk_indices: Optional[torch.Tensor] = None
+         self.qsa_shared_topk_visible_blocks: Optional[torch.Tensor] = None
+         self.qsa_shared_topk_captured_slots: set[int] = set()
++        self.draft_qsa_block_table: Optional[torch.Tensor] = None
++        self._draft_qsa_attention_pool_id: Optional[int] = None
++        self._draft_qsa_page_index_scale: Optional[int] = None
+         if not isinstance(self.kv_cache_manager, QSAMambaHybridCacheManagerV2):
+             raise TypeError("QSA sparse attention requires QSAMambaHybridCacheManagerV2")
+         if not isinstance(self.sparse_metadata_params, QSASparseMetadataParams):
+@@ -80,6 +83,24 @@
+         self._qsa_attention_pool_id, self._qsa_page_index_scale = (
+             self.kv_cache_manager.get_qsa_attention_pool_layout()
+         )
++        if (
++            self.draft_kv_cache_manager is not None
++            and isinstance(self.draft_kv_cache_manager, QSAMambaHybridCacheManagerV2)
++            and self.draft_kv_cache_manager.qsa_position_layer_id is not None
++        ):
++            self.draft_qsa_block_table = self.get_empty(
++                buffers,
++                (
++                    self.max_num_sequences,
++                    self.draft_kv_cache_manager.max_blocks_per_seq,
++                ),
++                cache_name="draft_qsa_block_table",
++                dtype=torch.int32,
++                capture_graph=capture_graph,
++            )
++            self._draft_qsa_attention_pool_id, self._draft_qsa_page_index_scale = (
++                self.draft_kv_cache_manager.get_qsa_attention_pool_layout()
++            )
+ 
+         # Packed-row mapping shared by compression, selection, and sparse GQA.
+         self.qsa_req_idx_per_token = self.get_empty(
+@@ -261,6 +282,23 @@
+             block_table=self.qsa_block_table[:num_seqs],
+             page_index_scale=self._qsa_page_index_scale,
+         )
++        if (
++            self.draft_qsa_block_table is not None
++            and self.draft_kv_cache_block_offsets is not None
++            and self._draft_qsa_attention_pool_id is not None
++            and self._draft_qsa_page_index_scale is not None
++        ):
++            draft_scaled = self.draft_kv_cache_block_offsets[
++                self._draft_qsa_attention_pool_id,
++                :num_seqs,
++                QSA_KEY_ROLE_INDEX,
++                :,
++            ]
++            triton_qsa_unscale_block_table(
++                scaled_block_table=draft_scaled,
++                block_table=self.draft_qsa_block_table[:num_seqs],
++                page_index_scale=self._draft_qsa_page_index_scale,
++            )
+ 
+     def _refresh_qsa_speculative_snapshot_state(self) -> None:
+         """Cache whether eager generation contains multi-token verification rows.
+@@ -278,6 +316,20 @@
+         self._refresh_qsa_block_table()
+         self._refresh_qsa_token_mapping()
+ 
++    def prepare_for_draft_forward(self) -> dict | None:
++        """Repoint QSA block table to the draft buffer for a draft forward."""
++        if self.draft_qsa_block_table is None:
++            return None
++        saved_state = {"qsa_block_table": self.qsa_block_table}
++        self.qsa_block_table = self.draft_qsa_block_table
++        return saved_state
++
++    def restore_after_draft_forward(self, saved_state: dict | None) -> None:
++        """Restore the target QSA block table after a draft forward."""
++        if saved_state is None:
++            return
++        self.qsa_block_table = saved_state["qsa_block_table"]
++
+     def prepare(self) -> None:
+         """Refresh host decisions, then rebuild graph-stable device mappings."""
+         super().prepare()

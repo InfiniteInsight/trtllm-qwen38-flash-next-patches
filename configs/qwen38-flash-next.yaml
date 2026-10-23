@@ -1,0 +1,22 @@
+enable_tokenization_cache: true
+enable_early_first_token_response: true
+sparse_attention_config:
+  algorithm: qsa
+  index_share_for_mtp_iteration: true
+kv_cache_config:
+  max_tokens: 1572864
+  free_gpu_memory_fraction: 0.9
+  dtype: fp8
+  enable_block_reuse: true
+  avg_seq_len: 163840
+  mamba_state_config:
+    additional_snapshot_offsets_from_end: [0]
+    enable_branch_snapshot: true
+    periodic_snapshot_interval: 65536
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 6
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+  use_rejection_sampling: true

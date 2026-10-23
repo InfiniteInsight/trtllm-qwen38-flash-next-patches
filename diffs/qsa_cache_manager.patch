@@ -1,0 +1,50 @@
+--- a/tensorrt_llm/_torch/attention/backends/sparse/qsa/cache_manager.py
++++ b/tensorrt_llm/_torch/attention/backends/sparse/qsa/cache_manager.py
+@@ -78,6 +78,26 @@
+         ]
+         self.qsa_position_layer_id: Optional[int] = None
+         super().__init__(*args, layer_mask=layer_mask, **kwargs)
++        if self.qsa_position_layer_id is not None:
++            local_idx = self.layer_offsets[self.qsa_position_layer_id]
++            conv = self.impl.get_page_index_converter(local_idx, Role.KEY)
++            upper = self.impl.get_page_index_upper_bound(local_idx, Role.KEY)
++            slots = (upper + int(conv.layer_offset)) // int(conv.scale)
++            from tensorrt_llm.logger import logger
++            logger.info(
++                f"QSAMambaHybridCacheManagerV2 ({'draft' if self.is_draft else 'target'}): "
++                f"allocated {slots} GPU page slots ({slots * self.tokens_per_block} tokens, scale={int(conv.scale)})"
++            )
++
++    def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
++        quota = super()._get_quota_from_max_tokens(max_tokens)
++        if self.is_draft and self.qsa_local_sparse_layer_ids:
++            # Target manager's quota includes periodic Mamba snapshot reserves that get
++            # redistributed to attention pages by TypicalStepDesc (~44.4k pages), whereas
++            # draft has 0 Mamba layers and 1 unamortized position buffer (652 vs 641 B/tok).
++            # Add 60 B/tok when sizing draft from max_tokens so draft always has >= target pages.
++            quota += max_tokens * (QSA_POSITION_COORDINATE_AXES * _POSITION_ELEMENT_BYTES + 48)
++        return quota
+ 
+     def get_disagg_role_mapper_kinds(self) -> Dict[DataRole, MapperKind]:
+         """Index positions are request-wide coordinates, so every rank holds
+@@ -136,6 +156,20 @@
+             )
+         return result
+ 
++    def _kv_pool_mapping_offset(self, layer_id, layer_group_id, key_base_addr) -> int:
++        """PILOT PATCH: under TP the per-layer INDEX_KEY sub-page (not TP-split) makes the coalesced
++        layer stride non-uniform relative to K+V, so the base exact_div asserts. Fall back to the
++        MiniMax-M3 positional formula (rank of the layer's K base address within its group); QSA's
++        own buffers are addressed through get_buffers()/page strides, not this offset."""
++        try:
++            return super()._kv_pool_mapping_offset(layer_id, layer_group_id, key_base_addr)
++        except AssertionError:
++            layers_by_addr = sorted(
++                self.impl.layer_grouping[int(layer_group_id)],
++                key=lambda lid: self.impl.get_mem_pool_base_address(lid, Role.KEY, PageIndexMode.SHARED),
++            )
++            return layers_by_addr.index(int(layer_id))
++
+     def get_index_k_buffer(
+         self,
+         layer_idx: int,

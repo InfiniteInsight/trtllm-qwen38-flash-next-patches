@@ -1,0 +1,15 @@
+--- a/tensorrt_llm/llmapi/reasoning_parser.py
++++ b/tensorrt_llm/llmapi/reasoning_parser.py
+@@ -224,6 +224,12 @@
+         super().__init__(chat_template_kwargs=chat_template_kwargs)
+         self.reasoning_start = "<think>"
+         self.reasoning_end = "</think>"
++        # PATCH: templates that pre-inject `<think>` only do so when
++        # thinking is enabled. Honour an explicit enable_thinking/thinking=False from the request,
++        # otherwise a thinking-OFF answer is misfiled entirely as reasoning_content.
++        _kw = chat_template_kwargs or {}
++        if reasoning_at_start and (_kw.get("enable_thinking") is False or _kw.get("thinking") is False):
++            reasoning_at_start = False
+         self.reasoning_at_start = reasoning_at_start
+         self.in_reasoning = self.reasoning_at_start
+         self._buffer = ""
